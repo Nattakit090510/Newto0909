@@ -9,6 +9,7 @@ Natural-language query engine for the commercial lending portfolio:
   5. Audit trail for every analytical output (audit_log.jsonl)
 
 Run locally:   streamlit run app.py
+API key:       sidebar -> 'API connection', or secrets / env vars / config.json
 """
 
 import json
@@ -40,59 +41,120 @@ EVALUATOR_MODEL = os.environ.get("EVALUATOR_MODEL", "gpt-4o")
 
 
 # --------------------------------------------------------------------------------------
-# CREDENTIALS  (st.secrets -> environment variables -> local config.json)
+# CREDENTIALS  (sidebar override -> st.secrets -> environment variables -> local config.json)
 # --------------------------------------------------------------------------------------
-def load_credentials():
-    """Load the OpenAI-compatible API key/base URL and expose them as environment variables
-    (ChatOpenAI reads OPENAI_API_KEY and OPENAI_BASE_URL). Never hard-code keys in this file."""
-    api_key, base_url = None, None
+def clean_value(value):
+    """Strip whitespace, newlines and stray quotes that commonly sneak in when keys are copy-pasted."""
+    if value is None:
+        return None
+    value = str(value).strip().strip('"').strip("'").strip()
+    return value or None
 
+
+def mask_key(key):
+    """Never display a full key: first 3 and last 4 characters only."""
+    if not key:
+        return "(none)"
+    return f"{key[:3]}...{key[-4:]}" if len(key) > 8 else "****"
+
+
+def stored_credentials():
+    """Credentials from configuration: Streamlit secrets -> environment variables -> config.json.
+    Returns (api_key, base_url, source)."""
     # 1) Streamlit secrets (.streamlit/secrets.toml locally, App settings -> Secrets on Streamlit Cloud)
     try:
         if "OPENAI_API_KEY" in st.secrets:
-            api_key = st.secrets["OPENAI_API_KEY"]
-            base_url = st.secrets.get("OPENAI_API_BASE", None)
+            key = clean_value(st.secrets["OPENAI_API_KEY"])
+            if key:
+                return key, clean_value(st.secrets.get("OPENAI_API_BASE", None)), "Streamlit secrets"
     except Exception:
         pass
 
     # 2) Environment variables
-    if not api_key and os.environ.get("OPENAI_API_KEY"):
-        api_key = os.environ["OPENAI_API_KEY"]
-        base_url = (
-            base_url
-            or os.environ.get("OPENAI_API_BASE")
-            or os.environ.get("OPENAI_BASE_URL")
-        )
+    key = clean_value(os.environ.get("OPENAI_API_KEY"))
+    if key:
+        base = clean_value(os.environ.get("OPENAI_API_BASE")) or clean_value(os.environ.get("OPENAI_BASE_URL"))
+        return key, base, "environment variables"
 
     # 3) Local config.json (same format the notebook used)
-    if not api_key:
-        config_path = BASE_DIR / "config.json"
-        if config_path.exists():
-            try:
-                with open(config_path, "r") as f:
-                    config = json.load(f)
-                api_key = config.get("OPENAI_API_KEY")
-                base_url = config.get("OPENAI_API_BASE")
-            except Exception:
-                pass
+    config_path = BASE_DIR / "config.json"
+    if config_path.exists():
+        try:
+            with open(config_path, "r") as f:
+                config = json.load(f)
+            key = clean_value(config.get("OPENAI_API_KEY"))
+            if key:
+                return key, clean_value(config.get("OPENAI_API_BASE")), "config.json"
+        except Exception:
+            pass
 
-    if api_key:
-        os.environ["OPENAI_API_KEY"] = api_key
-    if base_url:
-        os.environ["OPENAI_BASE_URL"] = base_url
-    return bool(api_key)
+    return None, None, None
+
+
+def resolve_credentials():
+    """Return (api_key, base_url, source). A key pasted in the sidebar wins for this browser session.
+    Credentials are passed to ChatOpenAI explicitly and are NOT written to os.environ, so one user's
+    session key can never leak into another session."""
+    stored_key, stored_base, stored_source = stored_credentials()
+    override_key = clean_value(st.session_state.get("override_key"))
+    if override_key:
+        base = clean_value(st.session_state.get("override_base")) or stored_base
+        return override_key, base, "sidebar (this session only)"
+    return stored_key, stored_base, stored_source
+
+
+def is_auth_error(exc):
+    low = str(exc).lower()
+    return ("401" in low or "authentication failed" in low or "token invalid" in low
+            or "invalid_api_key" in low or "incorrect api key" in low)
+
+
+def friendly_api_error(exc):
+    """Translate common API failures into an actionable message."""
+    text = str(exc)
+    low = text.lower()
+    if is_auth_error(exc):
+        return ("Authentication failed (401): the endpoint rejected the API key. The key is expired, revoked, "
+                "mistyped, or does not belong to this base URL. Enter a fresh key (and its matching base URL) under "
+                "'API connection' in the sidebar, or update your secrets, then click 'Test API connection'.")
+    if "403" in low or "permission" in low:
+        return ("Access denied (403): this key is not allowed to use the requested model or endpoint. "
+                f"Models in use: {LLM_MODEL} and {EVALUATOR_MODEL}.")
+    if "404" in low or "model_not_found" in low or "does not exist" in low:
+        return ("Model or endpoint not found (404): check the base URL and the LLM_MODEL / EVALUATOR_MODEL "
+                f"settings (currently {LLM_MODEL} and {EVALUATOR_MODEL}).")
+    if "429" in low or "rate limit" in low or "quota" in low:
+        return "Rate limit or quota reached (429): wait a moment and try again, or check the key's usage limits."
+    if "connection" in low or "timed out" in low or "name or service not known" in low:
+        return "Could not reach the API endpoint: check the base URL and your network connection."
+    return text
+
+
+def test_connection(api_key, base_url):
+    """Send a tiny request with each configured model and report a clear result."""
+    for model in dict.fromkeys([LLM_MODEL, EVALUATOR_MODEL]):
+        try:
+            ChatOpenAI(model=model, temperature=0, api_key=api_key, base_url=base_url,
+                       max_retries=0, timeout=30).invoke("Reply with the single word OK.")
+        except Exception as exc:  # noqa: BLE001
+            return False, f"Model `{model}`: {friendly_api_error(exc)}"
+    return True, f"Connection OK for {', '.join(dict.fromkeys([LLM_MODEL, EVALUATOR_MODEL]))}."
 
 
 @st.cache_resource(show_spinner=False)
-def get_llms():
-    """Initialise the generation LLM and the (stronger) evaluator LLM once per server process."""
-    llm_ = ChatOpenAI(model=LLM_MODEL, temperature=0)
-    evaluator_llm_ = ChatOpenAI(model=EVALUATOR_MODEL, temperature=0)
+def get_llms(api_key, base_url, llm_model, evaluator_model):
+    """Initialise the generation LLM and the (stronger) evaluator LLM. Cached per (key, base URL, models),
+    so changing the key takes effect immediately without clearing the cache."""
+    llm_ = ChatOpenAI(model=llm_model, temperature=0, api_key=api_key, base_url=base_url)
+    evaluator_llm_ = ChatOpenAI(model=evaluator_model, temperature=0, api_key=api_key, base_url=base_url)
     return llm_, evaluator_llm_
 
 
-CREDENTIALS_OK = load_credentials()
-llm, evaluator_llm = get_llms() if CREDENTIALS_OK else (None, None)
+API_KEY, API_BASE_URL, API_SOURCE = resolve_credentials()
+CREDENTIALS_OK = bool(API_KEY)
+llm, evaluator_llm = (
+    get_llms(API_KEY, API_BASE_URL, LLM_MODEL, EVALUATOR_MODEL) if CREDENTIALS_OK else (None, None)
+)
 
 
 # --------------------------------------------------------------------------------------
@@ -912,6 +974,8 @@ def render_result(result, question):
 
 def run_evaluation(ground_truth, db_connection):
     evaluation_rows = []
+    errors = []
+    aborted = False
     total = len(ground_truth)
     progress = st.progress(0.0, text="Running test cases...")
 
@@ -919,6 +983,7 @@ def run_evaluation(ground_truth, db_connection):
         result, error = execute_with_audit(gt['User Query'], db_connection, source='evaluation')
         if result is None:
             tr = {'route': 'error', 'query_id': None, 'confidence': None, 'row_count': None, 'escalated': True}
+            errors.append(f"{gt['Test Case']}: {error}")
         else:
             tr = result
 
@@ -935,11 +1000,20 @@ def run_evaluation(ground_truth, db_connection):
             'Confidence': tr['confidence'],
             'Rows Returned': tr['row_count'],
             'Escalated': bool(tr['escalated']),
+            'Error': str(error) if error is not None else '',
         })
         progress.progress((i + 1) / total, text=f"Completed {i + 1} of {total} test cases")
 
+        # An authentication failure affects every remaining test case: stop instead of failing them all
+        if error is not None and is_auth_error(error):
+            aborted = True
+            break
+
     progress.empty()
     evaluation_df = pd.DataFrame(evaluation_rows)
+
+    if aborted:
+        return {'df': evaluation_df, 'errors': errors, 'aborted': True}
 
     path_accuracy = evaluation_df['Route Match'].mean() * 100
 
@@ -953,11 +1027,52 @@ def run_evaluation(ground_truth, db_connection):
 
     return {
         'df': evaluation_df,
+        'errors': errors,
+        'aborted': False,
         'path_accuracy': path_accuracy,
         'query_accuracy': query_accuracy,
         'average_confidence': average_confidence,
         'escalation_rate': escalation_rate,
     }
+
+
+def key_format_hint(api_key, base_url):
+    """Gateway keys for the course endpoint start with 'gl-'. A stray extra character at the start
+    (e.g., a leading letter pasted with the key) produces a 401 'token invalid' error."""
+    if api_key and base_url and "mygreatlearning" in base_url and not api_key.startswith("gl-"):
+        return ("This gateway's keys normally start with 'gl-'. Check the key for an extra character "
+                "at the beginning (or end).")
+    return None
+
+
+def render_connection_panel():
+    """Sidebar: shows which credentials are in use (masked), lets the user paste a replacement key
+    for this session, and tests the connection."""
+    with st.sidebar:
+        st.header("API connection")
+        if CREDENTIALS_OK:
+            st.markdown(
+                f"**Source:** {API_SOURCE}  \n"
+                f"**Key:** `{mask_key(API_KEY)}` ({len(API_KEY)} characters)  \n"
+                f"**Base URL:** `{API_BASE_URL or 'OpenAI default'}`"
+            )
+            hint = key_format_hint(API_KEY, API_BASE_URL)
+            if hint:
+                st.warning(hint)
+        else:
+            st.warning("No API key found. Enter one below or configure secrets.")
+
+        with st.expander("Enter / replace API key", expanded=not CREDENTIALS_OK):
+            st.text_input("API key", type="password", key="override_key")
+            st.text_input("API base URL (optional)", key="override_base",
+                          placeholder=API_BASE_URL or "https://api.openai.com/v1")
+            st.caption("Kept only in this browser session and never written to disk. "
+                       "If you leave the base URL empty, the configured one is used.")
+
+        if CREDENTIALS_OK and st.button("Test API connection"):
+            with st.spinner("Testing connection..."):
+                ok, message = test_connection(API_KEY, API_BASE_URL)
+            (st.success if ok else st.error)(message)
 
 
 # --------------------------------------------------------------------------------------
@@ -968,10 +1083,13 @@ st.write("Ask commercial lending portfolio and credit-risk questions in plain En
          "Every answer shows the SQL used, the raw data, and a confidence score, and is written to the audit trail.")
 
 # --- Startup checks -----------------------------------------------------------------
+render_connection_panel()
+
 if not CREDENTIALS_OK:
     st.error(
-        "API credentials missing. Add OPENAI_API_KEY (and optionally OPENAI_API_BASE) to Streamlit secrets "
-        "(.streamlit/secrets.toml), set them as environment variables, or provide a local config.json."
+        "API credentials missing. Enter a key under 'API connection' in the sidebar, or add OPENAI_API_KEY "
+        "(and OPENAI_API_BASE) to Streamlit secrets (.streamlit/secrets.toml), environment variables, "
+        "or a local config.json."
     )
     st.stop()
 
@@ -1039,7 +1157,9 @@ with tab_ask:
                 result, error = execute_with_audit(question, conn, source='interactive')
             if error is not None:
                 st.session_state["last_result"] = None
-                st.error(f"Pipeline Error: {error}")
+                st.error(f"Pipeline Error: {friendly_api_error(error)}")
+                with st.expander("Technical details"):
+                    st.code(str(error))
             else:
                 st.session_state["last_result"] = {"result": result, "question": question}
 
@@ -1083,7 +1203,14 @@ with tab_eval:
             st.session_state["evaluation"] = run_evaluation(ground_truth, conn)
 
         evaluation = st.session_state.get("evaluation")
-        if evaluation:
+        if evaluation and evaluation.get('aborted'):
+            st.error(f"Evaluation stopped: {friendly_api_error(evaluation['errors'][0])}")
+            with st.expander("Technical details"):
+                st.code("\n".join(evaluation['errors']))
+        elif evaluation:
+            if evaluation['errors']:
+                st.error(f"{len(evaluation['errors'])} test case(s) failed with an error "
+                         f"(shown as escalated below). First error: {friendly_api_error(evaluation['errors'][0])}")
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Selected Path Accuracy", f"{evaluation['path_accuracy']:.1f}%")
             qa = evaluation['query_accuracy']
